@@ -41,6 +41,10 @@ export const StreamPlayer = ({ source, className }: StreamPlayerProps) => {
             const hls = new Hls({
               enableWorker: true,
               lowLatencyMode: true,
+              xhrSetup: (xhr: XMLHttpRequest, url: string) => {
+                // Enable CORS for cross-origin requests
+                xhr.withCredentials = false;
+              },
             });
             hls.loadSource(source.src);
             hls.attachMedia(video);
@@ -48,8 +52,9 @@ export const StreamPlayer = ({ source, className }: StreamPlayerProps) => {
               setIsLoading(false);
             });
             hls.on(Hls.Events.ERROR, (event, data) => {
+              console.error("HLS Error:", data);
               if (data.fatal) {
-                setError("Failed to load HLS stream");
+                setError(`Failed to load HLS stream: ${data.type}`);
                 setIsLoading(false);
               }
             });
@@ -63,12 +68,43 @@ export const StreamPlayer = ({ source, className }: StreamPlayerProps) => {
           // Load DASH
           const dashjs = await import("dashjs");
           const player = dashjs.MediaPlayer().create();
-          player.initialize(video, source.src, false);
+          
+          // Parse DRM parameters from URL if present
+          const urlObj = new URL(source.src, window.location.href);
+          const fullUrl = urlObj.href;
+          
+          // Check for clearkey DRM parameters (format: |drmScheme=clearkey&drmLicense=KID:KEY)
+          const drmMatch = fullUrl.match(/[|%7C]drmScheme=clearkey&drmLicense=([a-f0-9]+):([a-f0-9]+)/i);
+          
+          if (drmMatch) {
+            const kid = drmMatch[1];
+            const key = drmMatch[2];
+            
+            // Remove DRM parameters from URL
+            const cleanUrl = fullUrl.split(/[|%7C]drmScheme/)[0];
+            
+            // Configure clearkey DRM
+            const protData = {
+              "org.w3.clearkey": {
+                clearkeys: {
+                  [kid]: key
+                }
+              }
+            };
+            
+            console.log("Configuring DASH with clearkey DRM");
+            player.initialize(video, cleanUrl, false);
+            player.setProtectionData(protData);
+          } else {
+            player.initialize(video, source.src, false);
+          }
+          
           player.on("streamInitialized", () => {
             setIsLoading(false);
           });
-          player.on("error", () => {
-            setError("Failed to load DASH stream");
+          player.on("error", (e) => {
+            console.error("DASH Error:", e);
+            setError(`Failed to load DASH stream: ${e.error || 'Unknown error'}`);
             setIsLoading(false);
           });
           return () => player.destroy();
