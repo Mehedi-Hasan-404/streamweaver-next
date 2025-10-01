@@ -3,6 +3,8 @@ import { Play, Pause, Volume2, VolumeX, Maximize, Settings, Loader2 } from "luci
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
 import { cn } from "@/lib/utils";
+// @ts-ignore - Shaka Player types issue
+import shaka from "shaka-player/dist/shaka-player.compiled";
 
 interface StreamPlayerProps {
   source?: {
@@ -46,40 +48,21 @@ export const StreamPlayer = ({ source, className }: StreamPlayerProps) => {
         // Ensure CORS-friendly media element
         video.crossOrigin = "anonymous";
 
-        if (source.type === "hls" || source.src.includes(".m3u8")) {
-          // Load HLS
-          const Hls = (await import("hls.js")).default;
-          if (Hls.isSupported()) {
-            const hls = new Hls({
-              enableWorker: true,
-              lowLatencyMode: true,
-              xhrSetup: (xhr: XMLHttpRequest) => {
-                // Let browser handle CORS; no credentials by default
-                xhr.withCredentials = false;
-              },
-            });
-            hls.loadSource(source.src);
-            hls.attachMedia(video);
-            hls.on(Hls.Events.MANIFEST_PARSED, () => {
-              setIsLoading(false);
-            });
-            hls.on(Hls.Events.ERROR, (event, data) => {
-              console.error("HLS Error:", data);
-              if (data.fatal) {
-                setError(`Failed to load HLS stream: ${data.type}`);
-                setIsLoading(false);
-              }
-            });
-            return () => hls.destroy();
-          } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
-            // Native HLS support (Safari)
-            video.src = source.src;
+        // Use Shaka Player for HLS and DASH
+        if (source.type === "hls" || source.src.includes(".m3u8") || 
+            source.type === "dash" || source.src.includes(".mpd")) {
+          
+          // Install polyfills
+          shaka.polyfill.installAll();
+
+          if (!shaka.Player.isBrowserSupported()) {
+            setError("Browser not supported");
             setIsLoading(false);
+            return;
           }
-        } else if (source.type === "dash" || source.src.includes(".mpd")) {
-          // Load DASH
-          const dashjs = await import("dashjs");
-          const player = dashjs.MediaPlayer().create();
+
+          const player = new shaka.Player();
+          await player.attach(video);
 
           // Parse DRM parameters from URL if present
           const fullUrl = source.src;
@@ -91,6 +74,8 @@ export const StreamPlayer = ({ source, className }: StreamPlayerProps) => {
             return btoa(bin);
           };
 
+          let streamUrl = source.src;
+
           if (drmMatch) {
             const kidHex = drmMatch[1];
             const keyHex = drmMatch[2];
@@ -98,33 +83,39 @@ export const StreamPlayer = ({ source, className }: StreamPlayerProps) => {
             const keyB64 = hexToBase64(keyHex);
 
             // Remove DRM parameters from URL
-            const cleanUrl = fullUrl.split(/[|%7C]drmScheme/i)[0];
+            streamUrl = fullUrl.split(/[|%7C]drmScheme/i)[0];
 
-            // Configure ClearKey DRM (base64 kid:key)
-            const protData = {
-              "org.w3.clearkey": {
-                clearkeys: {
+            // Configure ClearKey DRM for Shaka Player
+            player.configure({
+              drm: {
+                clearKeys: {
                   [kidB64]: keyB64,
                 },
               },
-            } as any;
-
-            console.log("Configuring DASH with ClearKey DRM");
-            player.setProtectionData(protData);
-            player.initialize(video, cleanUrl, false);
-          } else {
-            player.initialize(video, source.src, false);
+            });
+            console.log("Configuring Shaka Player with ClearKey DRM");
           }
 
-          player.on("streamInitialized", () => {
+          // Error handling
+          player.addEventListener("error", (event: any) => {
+            console.error("Shaka Player Error:", event.detail);
+            setError(`Failed to load stream: ${event.detail?.message || "Unknown error"}`);
             setIsLoading(false);
           });
-          player.on("error", (e: any) => {
-            console.error("DASH Error:", e);
-            setError(`Failed to load DASH stream: ${e?.error || "Unknown error"}`);
+
+          // Load the stream
+          try {
+            await player.load(streamUrl);
             setIsLoading(false);
-          });
-          return () => player.destroy();
+          } catch (err: any) {
+            console.error("Error loading stream:", err);
+            setError(`Failed to load stream: ${err.message || "Unknown error"}`);
+            setIsLoading(false);
+          }
+
+          return () => {
+            player.destroy();
+          };
         } else {
           // Regular MP4 or direct stream
           video.src = source.src;
