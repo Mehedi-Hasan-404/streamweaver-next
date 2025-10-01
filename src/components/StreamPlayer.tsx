@@ -3,8 +3,6 @@ import { Play, Pause, Volume2, VolumeX, Maximize, Settings, Loader2 } from "luci
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
 import { cn } from "@/lib/utils";
-// @ts-ignore - Shaka Player types issue
-import shaka from "shaka-player/dist/shaka-player.compiled";
 
 interface StreamPlayerProps {
   source?: {
@@ -17,6 +15,7 @@ interface StreamPlayerProps {
 export const StreamPlayer = ({ source, className }: StreamPlayerProps) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const playerRef = useRef<any>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
   const [volume, setVolume] = useState([75]);
@@ -36,56 +35,92 @@ export const StreamPlayer = ({ source, className }: StreamPlayerProps) => {
 
     const loadStream = async () => {
       try {
-        // Block mixed-content (http stream on https page)
+        // Block mixed content
         if (window.location.protocol === "https:" && source.src.startsWith("http://")) {
-          setError(
-            "Insecure (http) stream blocked by the browser on an https page. Use an https URL or a proxy."
-          );
+          setError("HTTP streams are blocked on HTTPS pages");
           setIsLoading(false);
           return;
         }
 
-        // Ensure CORS-friendly media element
+        // Set CORS
         video.crossOrigin = "anonymous";
 
-        // Use Shaka Player for HLS and DASH
-        if (source.type === "hls" || source.src.includes(".m3u8") || 
-            source.type === "dash" || source.src.includes(".mpd")) {
+        // Detect stream type
+        const isHLS = source.type === "hls" || source.src.includes(".m3u8");
+        const isDASH = source.type === "dash" || source.src.includes(".mpd");
+
+        if (isHLS || isDASH) {
+          // Dynamically import Shaka Player
+          const shaka = await import("shaka-player/dist/shaka-player.ui");
           
           // Install polyfills
           shaka.polyfill.installAll();
 
           if (!shaka.Player.isBrowserSupported()) {
-            setError("Browser not supported");
+            setError("Your browser doesn't support this stream format");
             setIsLoading(false);
             return;
           }
 
+          // Clean up existing player
+          if (playerRef.current) {
+            await playerRef.current.destroy();
+            playerRef.current = null;
+          }
+
+          // Create new player
           const player = new shaka.Player();
+          playerRef.current = player;
+          
           await player.attach(video);
 
-          // Parse DRM parameters from URL if present
-          const fullUrl = source.src;
-          const drmMatch = fullUrl.match(/[|%7C]drmScheme=clearkey&drmLicense=([a-f0-9]+):([a-f0-9]+)/i);
+          // Configure player for better compatibility
+          player.configure({
+            streaming: {
+              retryParameters: {
+                timeout: 30000,
+                maxAttempts: 4,
+                baseDelay: 1000,
+                backoffFactor: 2,
+                fuzzFactor: 0.5,
+              },
+              bufferingGoal: 30,
+              rebufferingGoal: 2,
+              ignoreTextStreamFailures: true,
+            },
+            manifest: {
+              retryParameters: {
+                timeout: 30000,
+                maxAttempts: 4,
+                baseDelay: 1000,
+                backoffFactor: 2,
+                fuzzFactor: 0.5,
+              },
+            },
+          });
 
-          const hexToBase64 = (hex: string) => {
-            const bytes = hex.match(/.{1,2}/g)?.map((b) => parseInt(b, 16)) || [];
-            const bin = String.fromCharCode(...bytes);
-            return btoa(bin);
-          };
-
+          // Parse DRM if present
           let streamUrl = source.src;
+          const drmMatch = source.src.match(/[|%7C]drmScheme=clearkey&drmLicense=([a-f0-9]+):([a-f0-9]+)/i);
 
           if (drmMatch) {
             const kidHex = drmMatch[1];
             const keyHex = drmMatch[2];
+            
+            // Convert hex to base64
+            const hexToBase64 = (hex: string) => {
+              const bytes = hex.match(/.{1,2}/g)?.map((b) => parseInt(b, 16)) || [];
+              const bin = String.fromCharCode(...bytes);
+              return btoa(bin);
+            };
+
             const kidB64 = hexToBase64(kidHex);
             const keyB64 = hexToBase64(keyHex);
 
             // Remove DRM parameters from URL
-            streamUrl = fullUrl.split(/[|%7C]drmScheme/i)[0];
+            streamUrl = source.src.split(/[?|%7C]drmScheme/i)[0];
 
-            // Configure ClearKey DRM for Shaka Player
+            // Configure ClearKey DRM
             player.configure({
               drm: {
                 clearKeys: {
@@ -93,42 +128,60 @@ export const StreamPlayer = ({ source, className }: StreamPlayerProps) => {
                 },
               },
             });
-            console.log("Configuring Shaka Player with ClearKey DRM");
+
+            console.log("DRM configured with ClearKey");
           }
 
           // Error handling
           player.addEventListener("error", (event: any) => {
-            console.error("Shaka Player Error:", event.detail);
-            setError(`Failed to load stream: ${event.detail?.message || "Unknown error"}`);
+            console.error("Shaka error:", event.detail);
+            const detail = event.detail;
+            
+            let errorMessage = "Failed to load stream";
+            if (detail) {
+              if (detail.code === 1001) errorMessage = "Network request failed";
+              else if (detail.code === 6007) errorMessage = "DRM license request failed";
+              else if (detail.category === 3) errorMessage = "Network error";
+              else if (detail.category === 6) errorMessage = "DRM error";
+              else if (detail.message) errorMessage = detail.message;
+            }
+            
+            setError(errorMessage);
             setIsLoading(false);
           });
 
           // Load the stream
           try {
+            console.log("Loading stream:", streamUrl);
             await player.load(streamUrl);
+            console.log("Stream loaded successfully");
             setIsLoading(false);
           } catch (err: any) {
-            console.error("Error loading stream:", err);
-            setError(`Failed to load stream: ${err.message || "Unknown error"}`);
+            console.error("Load error:", err);
+            setError(err.message || "Failed to load stream");
             setIsLoading(false);
           }
-
-          return () => {
-            player.destroy();
-          };
         } else {
-          // Regular MP4 or direct stream
+          // Regular MP4
           video.src = source.src;
           setIsLoading(false);
         }
-      } catch (err) {
-        console.error("Error loading stream:", err);
-        setError("Failed to load stream");
+      } catch (err: any) {
+        console.error("Stream error:", err);
+        setError(err.message || "Failed to initialize player");
         setIsLoading(false);
       }
     };
 
     loadStream();
+
+    // Cleanup
+    return () => {
+      if (playerRef.current) {
+        playerRef.current.destroy().catch((e: any) => console.error("Cleanup error:", e));
+        playerRef.current = null;
+      }
+    };
   }, [source]);
 
   useEffect(() => {
@@ -217,6 +270,7 @@ export const StreamPlayer = ({ source, className }: StreamPlayerProps) => {
   };
 
   const formatTime = (seconds: number) => {
+    if (!isFinite(seconds)) return "0:00";
     const mins = Math.floor(seconds / 60);
     const secs = Math.floor(seconds % 60);
     return `${mins}:${secs.toString().padStart(2, "0")}`;
@@ -238,24 +292,21 @@ export const StreamPlayer = ({ source, className }: StreamPlayerProps) => {
         onClick={togglePlay}
       />
 
-      {/* Loading Overlay */}
       {isLoading && (
         <div className="absolute inset-0 flex items-center justify-center bg-black/50 backdrop-blur-sm">
           <Loader2 className="w-12 h-12 animate-spin text-primary" />
         </div>
       )}
 
-      {/* Error Overlay */}
       {error && (
         <div className="absolute inset-0 flex items-center justify-center bg-black/80 backdrop-blur-sm">
-          <div className="text-center">
+          <div className="text-center px-4">
             <p className="text-destructive text-lg mb-2">{error}</p>
-            <p className="text-muted-foreground text-sm">Please check the stream URL</p>
+            <p className="text-muted-foreground text-sm">Check console for details</p>
           </div>
         </div>
       )}
 
-      {/* Center Play Button */}
       {!isPlaying && !isLoading && !error && (
         <div className="absolute inset-0 flex items-center justify-center">
           <Button
@@ -269,14 +320,12 @@ export const StreamPlayer = ({ source, className }: StreamPlayerProps) => {
         </div>
       )}
 
-      {/* Controls Overlay */}
       <div
         className={cn(
           "absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/90 via-black/70 to-transparent p-6 transition-all duration-300",
           showControls || !isPlaying ? "opacity-100" : "opacity-0 pointer-events-none"
         )}
       >
-        {/* Progress Bar */}
         <div className="mb-4">
           <Slider
             value={[currentTime]}
@@ -291,7 +340,6 @@ export const StreamPlayer = ({ source, className }: StreamPlayerProps) => {
           </div>
         </div>
 
-        {/* Control Buttons */}
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
             <Button
