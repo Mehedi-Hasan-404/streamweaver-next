@@ -584,5 +584,3 @@ export const StreamPlayer = ({ source, className }: StreamPlayerProps) => {
     </div>
   );
 };
-
-export default StreamPlayer;
