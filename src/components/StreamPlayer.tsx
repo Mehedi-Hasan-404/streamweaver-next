@@ -34,6 +34,18 @@ export const StreamPlayer = ({ source, className }: StreamPlayerProps) => {
 
     const loadStream = async () => {
       try {
+        // Block mixed-content (http stream on https page)
+        if (window.location.protocol === "https:" && source.src.startsWith("http://")) {
+          setError(
+            "Insecure (http) stream blocked by the browser on an https page. Use an https URL or a proxy."
+          );
+          setIsLoading(false);
+          return;
+        }
+
+        // Ensure CORS-friendly media element
+        video.crossOrigin = "anonymous";
+
         if (source.type === "hls" || source.src.includes(".m3u8")) {
           // Load HLS
           const Hls = (await import("hls.js")).default;
@@ -41,8 +53,8 @@ export const StreamPlayer = ({ source, className }: StreamPlayerProps) => {
             const hls = new Hls({
               enableWorker: true,
               lowLatencyMode: true,
-              xhrSetup: (xhr: XMLHttpRequest, url: string) => {
-                // Enable CORS for cross-origin requests
+              xhrSetup: (xhr: XMLHttpRequest) => {
+                // Let browser handle CORS; no credentials by default
                 xhr.withCredentials = false;
               },
             });
@@ -68,43 +80,48 @@ export const StreamPlayer = ({ source, className }: StreamPlayerProps) => {
           // Load DASH
           const dashjs = await import("dashjs");
           const player = dashjs.MediaPlayer().create();
-          
+
           // Parse DRM parameters from URL if present
-          const urlObj = new URL(source.src, window.location.href);
-          const fullUrl = urlObj.href;
-          
-          // Check for clearkey DRM parameters (format: |drmScheme=clearkey&drmLicense=KID:KEY)
+          const fullUrl = source.src;
           const drmMatch = fullUrl.match(/[|%7C]drmScheme=clearkey&drmLicense=([a-f0-9]+):([a-f0-9]+)/i);
-          
+
+          const hexToBase64 = (hex: string) => {
+            const bytes = hex.match(/.{1,2}/g)?.map((b) => parseInt(b, 16)) || [];
+            const bin = String.fromCharCode(...bytes);
+            return btoa(bin);
+          };
+
           if (drmMatch) {
-            const kid = drmMatch[1];
-            const key = drmMatch[2];
-            
+            const kidHex = drmMatch[1];
+            const keyHex = drmMatch[2];
+            const kidB64 = hexToBase64(kidHex);
+            const keyB64 = hexToBase64(keyHex);
+
             // Remove DRM parameters from URL
-            const cleanUrl = fullUrl.split(/[|%7C]drmScheme/)[0];
-            
-            // Configure clearkey DRM
+            const cleanUrl = fullUrl.split(/[|%7C]drmScheme/i)[0];
+
+            // Configure ClearKey DRM (base64 kid:key)
             const protData = {
               "org.w3.clearkey": {
                 clearkeys: {
-                  [kid]: key
-                }
-              }
-            };
-            
-            console.log("Configuring DASH with clearkey DRM");
-            player.initialize(video, cleanUrl, false);
+                  [kidB64]: keyB64,
+                },
+              },
+            } as any;
+
+            console.log("Configuring DASH with ClearKey DRM");
             player.setProtectionData(protData);
+            player.initialize(video, cleanUrl, false);
           } else {
             player.initialize(video, source.src, false);
           }
-          
+
           player.on("streamInitialized", () => {
             setIsLoading(false);
           });
-          player.on("error", (e) => {
+          player.on("error", (e: any) => {
             console.error("DASH Error:", e);
-            setError(`Failed to load DASH stream: ${e.error || 'Unknown error'}`);
+            setError(`Failed to load DASH stream: ${e?.error || "Unknown error"}`);
             setIsLoading(false);
           });
           return () => player.destroy();
